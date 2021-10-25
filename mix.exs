@@ -52,9 +52,19 @@ defmodule GRPC.Mixfile do
     ]
   end
 
+  # defp package do
+  #   %{
+  #     maintainers: ["Bing Han"],
+  #     licenses: ["Apache 2"],
+  #     links: %{"GitHub" => "https://github.com/elixir-grpc/grpc"},
+  #     files: ~w(mix.exs README.md lib src config LICENSE .formatter.exs)
+  #   }
+  # end
+
   defp package do
     %{
-      maintainers: ["Bing Han"],
+      organization: "tubitv",
+      maintainers: "",
       licenses: ["Apache 2"],
       links: %{"GitHub" => "https://github.com/elixir-grpc/grpc"},
       files: ~w(mix.exs README.md lib src config LICENSE .formatter.exs)
