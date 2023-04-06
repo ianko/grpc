@@ -3,7 +3,7 @@ defmodule GRPC.Stub do
   A module acting as the interface for gRPC client.
 
   You can do everything in the client side via `GRPC.Stub`, including connecting,
-  sending/receiving steaming or non-steaming requests, canceling calls and so on.
+  sending/receiving streaming or non-streaming requests, canceling calls and so on.
 
   A service is needed to define a stub:
 
@@ -44,13 +44,16 @@ defmodule GRPC.Stub do
   # 10 seconds
   @default_timeout 10000
 
-  @type rpc_return ::
-          {:ok, struct}
-          | {:ok, struct, map}
-          | GRPC.Client.Stream.t()
+  @type receive_data_return ::
+          {:ok, struct()}
+          | {:ok, struct(), map()}
           | {:ok, Enumerable.t()}
-          | {:ok, Enumerable.t(), map}
+          | {:ok, Enumerable.t(), map()}
+
+  @type rpc_return ::
+          GRPC.Client.Stream.t()
           | {:error, GRPC.RPCError.t()}
+          | receive_data_return
 
   require Logger
 
@@ -121,11 +124,11 @@ defmodule GRPC.Stub do
     * `:interceptors` - client interceptors
     * `:codec` - client will use this to encode and decode binary message
     * `:compressor` - the client will use this to compress requests and decompress responses. If this is set, accepted_compressors
-        will be appended also, so this can be used safely without `:accesspted_compressors`.
+        will be appended also, so this can be used safely without `:accepted_compressors`.
     * `:accepted_compressors` - tell servers accepted compressors, this can be used without `:compressor`
     * `:headers` - headers to attach to each request
   """
-  @spec connect(String.t(), Keyword.t()) :: {:ok, GRPC.Channel.t()} | {:error, any}
+  @spec connect(String.t(), keyword()) :: {:ok, Channel.t()} | {:error, any()}
   def connect(addr, opts \\ []) when is_binary(addr) and is_list(opts) do
     {host, port} =
       case String.split(addr, ":") do
@@ -136,24 +139,25 @@ defmodule GRPC.Stub do
     connect(host, port, opts)
   end
 
-  @spec connect(String.t(), binary | non_neg_integer, keyword) ::
-          {:ok, Channel.t()} | {:error, any}
+  @spec connect(String.t(), binary() | non_neg_integer(), keyword()) ::
+          {:ok, Channel.t()} | {:error, any()}
   def connect(host, port, opts) when is_binary(port) do
     connect(host, String.to_integer(port), opts)
   end
 
   def connect(host, port, opts) when is_integer(port) do
-    adapter =
-      Keyword.get(
-        opts,
-        :adapter,
-        Application.get_env(:grpc, :http2_client_adapter, GRPC.Adapter.Gun)
-      )
+    if Application.get_env(:grpc, :http2_client_adapter) do
+      raise "the :http2_client_adapter config key has been deprecated.\
+      The currently supported way is to configure it\
+      through the :adapter option for GRPC.Stub.connect/3"
+    end
+
+    adapter = Keyword.get(opts, :adapter) || GRPC.Client.Adapters.Gun
 
     cred = Keyword.get(opts, :cred)
     scheme = if cred, do: @secure_scheme, else: @insecure_scheme
-    interceptors = Keyword.get(opts, :interceptors, []) |> init_interceptors
-    codec = Keyword.get(opts, :codec, GRPC.Codec.Proto)
+    interceptors = (Keyword.get(opts, :interceptors) || []) |> init_interceptors
+    codec = Keyword.get(opts, :codec) || GRPC.Codec.Proto
     compressor = Keyword.get(opts, :compressor)
     accepted_compressors = Keyword.get(opts, :accepted_compressors) || []
     headers = Keyword.get(opts, :headers) || []
@@ -164,6 +168,12 @@ defmodule GRPC.Stub do
       else
         accepted_compressors
       end
+
+    adapter_opts = opts[:adapter_opts] || []
+
+    unless is_list(adapter_opts) do
+      raise ArgumentError, ":adapter_opts must be a keyword list if present"
+    end
 
     %Channel{
       host: host,
@@ -177,7 +187,7 @@ defmodule GRPC.Stub do
       accepted_compressors: accepted_compressors,
       headers: headers
     }
-    |> adapter.connect(opts[:adapter_opts])
+    |> adapter.connect(adapter_opts)
   end
 
   def retry_timeout(curr) when curr < 11 do
@@ -188,14 +198,7 @@ defmodule GRPC.Stub do
         120_000
       end
 
-    uniform_fn =
-      if function_exported?(:rand, :uniform_real, 0) do
-        :uniform_real
-      else
-        :uniform
-      end
-
-    jitter = (apply(:rand, uniform_fn, []) - 0.5) / 2.5
+    jitter = (:rand.uniform_real() - 0.5) / 2.5
 
     round(timeout + jitter * timeout)
   end
@@ -210,31 +213,29 @@ defmodule GRPC.Stub do
   @doc """
   Disconnects the adapter and frees any resources the adapter is consuming
   """
-  @spec disconnect(Channel.t()) :: {:ok, Channel.t()} | {:error, any}
+  @spec disconnect(Channel.t()) :: {:ok, Channel.t()} | {:error, any()}
   def disconnect(%Channel{adapter: adapter} = channel) do
     adapter.disconnect(channel)
   end
 
-  @doc """
-  The actual function invoked when invoking a rpc function.
-
-  ## Returns
-
-    * Unary calls. `{:ok, reply} | {:ok, headers_map} | {:error, error}`
-    * Client streaming. A `GRPC.Client.Stream`
-    * Server streaming. `{:ok, Enumerable.t} | {:ok, Enumerable.t, trailers_map} | {:error, error}`
-
-  ## Options
-
-    * `:timeout` - request timeout. Default is 10s for unary calls and `:infinity` for
-      client or server streaming calls
-    * `:deadline` - when the request is timeout, will override timeout
-    * `:metadata` - a map, your custom metadata
-    * `:return_headers` - default is false. When it's true, a three elem tuple will be returned
-      with the last elem being a map of headers `%{headers: headers, trailers: trailers}`(unary) or
-      `%{headers: headers}`(server streaming)
-  """
-  @spec call(atom, tuple, GRPC.Client.Stream.t(), struct | nil, keyword) :: rpc_return
+  @doc false
+  #  #  The actual function invoked when invoking an RPC function.
+  #
+  #  Returns
+  #
+  #    * Unary calls. `{:ok, reply} | {:ok, headers_map} | {:error, error}`
+  #    * Client streaming. A `GRPC.Client.Stream`
+  #    * Server streaming. `{:ok, Enumerable.t} | {:ok, Enumerable.t, trailers_map} | {:error, error}`
+  #
+  #  Options
+  #
+  #    * `:timeout` - request timeout. Default is 10s for unary calls and `:infinity` for
+  #      client or server streaming calls
+  #    * `:deadline` - when the request is timeout, will override timeout
+  #    * `:metadata` - a map, your custom metadata
+  #    * `:return_headers` - default is false. When it's true, a three elem tuple will be returned
+  #      with the last elem being a map of headers `%{headers: headers, trailers: trailers}`(unary) or
+  #      `%{headers: headers}`(server streaming)
   def call(_service_mod, rpc, %{channel: channel} = stream, request, opts) do
     {_, {req_mod, req_stream}, {res_mod, response_stream}} = rpc
 
@@ -247,8 +248,8 @@ defmodule GRPC.Stub do
         parse_req_opts([{:timeout, @default_timeout} | opts])
       end
 
-    compressor = Map.get(opts, :compressor, channel.compressor)
-    accepted_compressors = Map.get(opts, :accepted_compressors, [])
+    compressor = Keyword.get(opts, :compressor, channel.compressor)
+    accepted_compressors = Keyword.get(opts, :accepted_compressors, [])
 
     accepted_compressors =
       if compressor do
@@ -259,8 +260,8 @@ defmodule GRPC.Stub do
 
     stream = %{
       stream
-      | codec: Map.get(opts, :codec, channel.codec),
-        compressor: Map.get(opts, :compressor, channel.compressor),
+      | codec: Keyword.get(opts, :codec, channel.codec),
+        compressor: Keyword.get(opts, :compressor, channel.compressor),
         accepted_compressors: accepted_compressors
     }
 
@@ -275,7 +276,7 @@ defmodule GRPC.Stub do
        ) do
     last = fn %{codec: codec, compressor: compressor} = s, _ ->
       message = codec.encode(request)
-      opts = Map.put(opts, :compressor, compressor)
+      opts = Keyword.put(opts, :compressor, compressor)
 
       s
       |> channel.adapter.send_request(message, opts)
@@ -322,7 +323,7 @@ defmodule GRPC.Stub do
     * `:end_stream` - indicates it's the last one request, then the stream will be in
       half_closed state. Default is false.
   """
-  @spec send_request(GRPC.Client.Stream.t(), struct, Keyword.t()) :: GRPC.Client.Stream.t()
+  @spec send_request(GRPC.Client.Stream.t(), struct, keyword()) :: GRPC.Client.Stream.t()
   def send_request(%{__interface__: interface} = stream, request, opts \\ []) do
     interface[:send_request].(stream, request, opts)
   end
@@ -347,8 +348,8 @@ defmodule GRPC.Stub do
 
   After that, callings to `recv/2` will return a CANCEL error.
   """
-  def cancel(%{channel: channel, payload: payload} = stream) do
-    case channel.adapter.cancel(channel.adapter_payload, payload) do
+  def cancel(%{channel: channel} = stream) do
+    case channel.adapter.cancel(stream) do
       :ok -> %{stream | canceled: true}
       other -> other
     end
@@ -370,21 +371,39 @@ defmodule GRPC.Stub do
       {:ok, reply} = GRPC.Stub.recv(stream)
 
       # Reply is streaming
-      {:ok, enum} = GRPC.Stub.recv(stream)
-      replies = Enum.map(enum, fn({:ok, reply}) -> reply end)
+      {:ok, ex_stream} = GRPC.Stub.recv(stream)
+      replies = Enum.map(ex_stream, fn({:ok, reply}) -> reply end)
 
   ## Options
 
     * `:timeout` - request timeout
     * `:deadline` - when the request is timeout, will override timeout
     * `:return_headers` - when true, headers will be returned.
+
+  ## Stream behavior
+  We build the Stream struct using `Stream.unfold/2`.
+
+  The unfold function is built in such a way that  - for both adapters - the accumulator is a map used to find the
+  `connection_stream`process and the `next_fun` argument is a function that reads directly from the `connection_stream`
+  that is producing data.
+  Every time we execute `next_fun` we read a chunk of data. This means that `next_fun` will have the side effect of updating the state of the `connection_stream` process, removing the chunk of data that's being read from the underlying `GenServer`'s state.
+
+
+  ## Examples
+
+      iex> ex_stream |> Stream.take(1) |> Enum.to_list()
+      [1]
+      iex> ex_stream |> Enum.to_list()
+      [2, 3]
+      iex> ex_stream |> Enum.to_list()
+      []
   """
-  @spec recv(GRPC.Client.Stream.t(), keyword | map) ::
-          {:ok, struct}
-          | {:ok, struct, map}
+  @spec recv(GRPC.Client.Stream.t(), keyword()) ::
+          {:ok, struct()}
+          | {:ok, struct(), map()}
           | {:ok, Enumerable.t()}
-          | {:ok, Enumerable.t(), map}
-          | {:error, any}
+          | {:ok, Enumerable.t(), map()}
+          | {:error, any()}
   def recv(stream, opts \\ [])
 
   def recv(%{canceled: true}, _) do
@@ -394,266 +413,56 @@ defmodule GRPC.Stub do
   def recv(%{__interface__: interface} = stream, opts) do
     opts =
       if is_list(opts) do
-        parse_recv_opts(opts)
+        parse_recv_opts(Keyword.put_new(opts, :timeout, @default_timeout))
       else
         opts
       end
 
-    interface[:recv].(stream, opts)
+    interface[:receive_data].(stream, opts)
   end
 
-  @doc false
-  def do_recv(%{server_stream: true, channel: channel, payload: payload} = stream, opts) do
-    case recv_headers(channel.adapter, channel.adapter_payload, payload, opts) do
-      {:ok, headers, is_fin} ->
-        res_enum =
-          case is_fin do
-            :fin -> []
-            :nofin -> response_stream(stream, opts)
-          end
+  @valid_req_opts [
+    :timeout,
+    :deadline,
+    :compressor,
+    :accepted_compressors,
+    :grpc_encoding,
+    :metadata,
+    :codec,
+    :return_headers
+  ]
+  defp parse_req_opts(opts) when is_list(opts) do
+    # Map.new is used so we can keep the last value
+    # passed for a given key
+    opts
+    |> Map.new(fn
+      {:deadline, deadline} ->
+        {:timeout, GRPC.TimeUtils.to_relative(deadline)}
 
-        if opts[:return_headers] do
-          {:ok, res_enum, %{headers: headers}}
-        else
-          {:ok, res_enum}
-        end
+      {key, value} when key in @valid_req_opts ->
+        {key, value}
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+      {key, _} ->
+        raise ArgumentError, "option #{inspect(key)} is not supported"
+    end)
+    |> Map.to_list()
   end
-
-  def do_recv(
-        %{payload: payload, channel: channel} = stream,
-        opts
-      ) do
-    with {:ok, headers, _is_fin} <-
-           recv_headers(channel.adapter, channel.adapter_payload, payload, opts),
-         {:ok, body, trailers} <-
-           recv_body(channel.adapter, channel.adapter_payload, payload, opts) do
-      {status, msg} = parse_response(stream, headers, body, trailers)
-
-      if opts[:return_headers] do
-        {status, msg, %{headers: headers, trailers: trailers}}
-      else
-        {status, msg}
-      end
-    else
-      error = {:error, _} ->
-        error
-    end
-  end
-
-  defp recv_headers(adapter, conn_payload, stream_payload, opts) do
-    case adapter.recv_headers(conn_payload, stream_payload, opts) do
-      {:ok, headers, is_fin} ->
-        {:ok, GRPC.Transport.HTTP2.decode_headers(headers), is_fin}
-
-      other ->
-        other
-    end
-  end
-
-  defp recv_body(adapter, conn_payload, stream_payload, opts) do
-    recv_body(adapter, conn_payload, stream_payload, "", opts)
-  end
-
-  defp recv_body(adapter, conn_payload, stream_payload, acc, opts) do
-    case adapter.recv_data_or_trailers(conn_payload, stream_payload, opts) do
-      {:data, data} ->
-        recv_body(adapter, conn_payload, stream_payload, <<acc::binary, data::binary>>, opts)
-
-      {:trailers, trailers} ->
-        {:ok, acc, GRPC.Transport.HTTP2.decode_headers(trailers)}
-    end
-  end
-
-  defp parse_response(
-         %{response_mod: res_mod, codec: codec, accepted_compressors: accepted_compressors},
-         headers,
-         body,
-         trailers
-       ) do
-    case parse_trailers(trailers) do
-      :ok ->
-        compressor =
-          case headers do
-            %{"grpc-encoding" => encoding} ->
-              Enum.find(accepted_compressors, nil, fn c -> c.name() == encoding end)
-
-            _ ->
-              nil
-          end
-
-        case GRPC.Message.from_data(%{compressor: compressor}, body) do
-          {:ok, msg} ->
-            {:ok, codec.decode(msg, res_mod)}
-
-          err ->
-            err
-        end
-
-      error ->
-        error
-    end
-  end
-
-  defp parse_trailers(trailers) do
-    status = String.to_integer(trailers["grpc-status"])
-
-    if status == GRPC.Status.ok() do
-      :ok
-    else
-      {:error, %GRPC.RPCError{status: status, message: trailers["grpc-message"]}}
-    end
-  end
-
-  defp response_stream(
-         %{
-           channel: %{adapter: adapter, adapter_payload: ap},
-           response_mod: res_mod,
-           codec: codec,
-           payload: payload
-         },
-         opts
-       ) do
-    state = %{
-      adapter: adapter,
-      adapter_payload: ap,
-      payload: payload,
-      buffer: <<>>,
-      fin: false,
-      need_more: true,
-      opts: opts,
-      response_mod: res_mod,
-      codec: codec
-    }
-
-    Stream.unfold(state, fn s -> read_stream(s) end)
-  end
-
-  defp read_stream(%{buffer: <<>>, fin: true, fin_resp: nil}), do: nil
-
-  defp read_stream(%{buffer: <<>>, fin: true, fin_resp: fin_resp} = s),
-    do: {fin_resp, Map.put(s, :fin_resp, nil)}
-
-  defp read_stream(
-         %{
-           adapter: adapter,
-           adapter_payload: ap,
-           payload: payload,
-           buffer: buffer,
-           need_more: true,
-           opts: opts
-         } = s
-       ) do
-    case adapter.recv_data_or_trailers(ap, payload, opts) do
-      {:data, data} ->
-        buffer = buffer <> data
-        new_s = s |> Map.put(:need_more, false) |> Map.put(:buffer, buffer)
-        read_stream(new_s)
-
-      {:trailers, trailers} ->
-        trailers = GRPC.Transport.HTTP2.decode_headers(trailers)
-
-        case parse_trailers(trailers) do
-          :ok ->
-            fin_resp =
-              if opts[:return_headers] do
-                {:trailers, trailers}
-              end
-
-            new_s = s |> Map.put(:fin, true) |> Map.put(:fin_resp, fin_resp)
-            read_stream(new_s)
-
-          error ->
-            {error, %{buffer: <<>>, fin: true, fin_resp: nil}}
-        end
-
-      error = {:error, _} ->
-        {error, %{buffer: <<>>, fin: true, fin_resp: nil}}
-    end
-  end
-
-  defp read_stream(%{buffer: buffer, need_more: false, response_mod: res_mod, codec: codec} = s) do
-    case GRPC.Message.get_message(buffer) do
-      # TODO
-      {{_, message}, rest} ->
-        reply = codec.decode(message, res_mod)
-        new_s = Map.put(s, :buffer, rest)
-        {{:ok, reply}, new_s}
-
-      _ ->
-        read_stream(Map.put(s, :need_more, true))
-    end
-  end
-
-  defp parse_req_opts(list) when is_list(list) do
-    parse_req_opts(list, %{})
-  end
-
-  defp parse_req_opts([{:timeout, timeout} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :timeout, timeout))
-  end
-
-  defp parse_req_opts([{:deadline, deadline} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :timeout, GRPC.TimeUtils.to_relative(deadline)))
-  end
-
-  defp parse_req_opts([{:compressor, compressor} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :compressor, compressor))
-  end
-
-  defp parse_req_opts([{:accepted_compressors, compressors} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :accepted_compressors, compressors))
-  end
-
-  defp parse_req_opts([{:grpc_encoding, grpc_encoding} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :grpc_encoding, grpc_encoding))
-  end
-
-  defp parse_req_opts([{:metadata, metadata} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :metadata, metadata))
-  end
-
-  defp parse_req_opts([{:content_type, content_type} | t], acc) do
-    Logger.warn(":content_type has been deprecated, please use :codec")
-    parse_req_opts(t, Map.put(acc, :content_type, content_type))
-  end
-
-  defp parse_req_opts([{:codec, codec} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :codec, codec))
-  end
-
-  defp parse_req_opts([{:return_headers, return_headers} | t], acc) do
-    parse_req_opts(t, Map.put(acc, :return_headers, return_headers))
-  end
-
-  defp parse_req_opts([{key, _} | _], _) do
-    raise ArgumentError, "option #{inspect(key)} is not supported"
-  end
-
-  defp parse_req_opts(_, acc), do: acc
 
   defp parse_recv_opts(list) when is_list(list) do
-    parse_recv_opts(list, %{timeout: @default_timeout})
-  end
+    # Map.new is used so we can keep the last value
+    # passed for a given key
 
-  defp parse_recv_opts([{:timeout, timeout} | t], acc) do
-    parse_recv_opts(t, Map.put(acc, :timeout, timeout))
-  end
+    list
+    |> Map.new(fn
+      {:deadline, deadline} ->
+        {:deadline, GRPC.TimeUtils.to_relative(deadline)}
 
-  defp parse_recv_opts([{:deadline, deadline} | t], acc) do
-    parse_recv_opts(t, Map.put(acc, :deadline, GRPC.TimeUtils.to_relative(deadline)))
-  end
+      {key, _} when key not in @valid_req_opts ->
+        raise ArgumentError, "option #{inspect(key)} is not supported"
 
-  defp parse_recv_opts([{:return_headers, return_headers} | t], acc) do
-    parse_recv_opts(t, Map.put(acc, :return_headers, return_headers))
+      kv ->
+        kv
+    end)
+    |> Map.to_list()
   end
-
-  defp parse_recv_opts([{key, _} | _], _) do
-    raise ArgumentError, "option #{inspect(key)} is not supported"
-  end
-
-  defp parse_recv_opts(_, acc), do: acc
 end
